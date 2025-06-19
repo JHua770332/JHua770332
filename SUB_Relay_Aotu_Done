@@ -1,0 +1,313 @@
+import datetime
+import serial
+import time
+import os
+import threading
+import logging
+import random
+import requests
+import json
+import hmac
+import base64
+import hashlib
+from urllib.parse import quote_plus
+
+# 创建一个锁对象，用于线程安全的文件操作
+file_lock = threading.Lock()
+
+# 配置日志记录
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('relay_operation.log', mode='a', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+
+# 钉钉配置
+DINGTALK_WEBHOOK = "https://oapi.dingtalk.com/robot/send?access_token=6fab3c8901812aebb0b50bd0bb8c2f46f07647c91d2e141e1fd937a409740b62"
+DINGTALK_SECRET = "SEC34de44b19e7b2c224318c96907969556dcd3e83836a9964e1d8a4f96b709454e"
+KEYWORDS = ["继电器测试", "测试报告"]  # 钉钉机器人预设关键词
+
+def check_time_sync():
+    """检查本地时间与网络时间的同步性"""
+    try:
+        response = requests.get('https://timeapi.io/api/Time/current/zone?timeZone=Asia/Shanghai')
+        if response.status_code == 200:
+            server_time = response.json().get('dateTime')
+            server_timestamp = datetime.datetime.fromisoformat(server_time.replace('Z', '+00:00')).timestamp()
+            local_timestamp = time.time()
+            diff = abs(server_timestamp - local_timestamp)
+            if diff > 3600:  # 超过1小时
+                logging.warning(f"本地时间与服务器时间相差 {diff:.2f} 秒，可能导致签名验证失败")
+                return False
+        return True
+    except:
+        logging.warning("无法获取网络时间，跳过时间同步检查")
+        return True
+
+def generate_signature(timestamp, secret):
+    """生成钉钉签名"""
+    string_to_sign = f"{timestamp}\n{secret}"
+    hmac_code = hmac.new(
+        secret.encode('utf-8'),
+        string_to_sign.encode('utf-8'),
+        digestmod=hashlib.sha256
+    ).digest()
+    return base64.b64encode(hmac_code).decode('utf-8')
+
+def send_dingtalk_notification(content):
+    """发送钉钉通知"""
+    try:
+        # 检查时间同步
+        check_time_sync()
+        
+        # 1. 生成时间戳和签名
+        timestamp = str(round(time.time() * 1000))
+        sign = generate_signature(timestamp, DINGTALK_SECRET)
+        
+        # 2. 构造完整URL
+        url = f"{DINGTALK_WEBHOOK}&timestamp={timestamp}&sign={quote_plus(sign)}"
+        logging.debug(f"生成的URL: {url}")
+        
+        # 3. 确保内容包含关键词
+        logging.info(f"检查关键词: {KEYWORDS} in {content[:50]}...")
+        if not any(keyword in content for keyword in KEYWORDS):
+            content = f"【{'|'.join(KEYWORDS)}】{content}"
+            logging.info(f"添加关键词前缀后的内容: {content[:50]}...")
+        
+        # 4. 发送Markdown消息
+        headers = {"Content-Type": "application/json"}
+        data = {
+            "msgtype": "markdown",
+            "markdown": {
+                "title": "继电器自动化测试报告",
+                "text": content
+            }
+        }
+        
+        # 发送请求并记录详细日志
+        logging.info(f"发送钉钉消息: {content[:100]}...")
+        response = requests.post(url, headers=headers, data=json.dumps(data))
+        result = response.json()
+        logging.info(f"钉钉响应: {result}")
+        
+        # 5. 错误处理
+        if result.get("errcode") != 0:
+            logging.error(f"钉钉消息发送失败: {result}")
+            
+            # 5.1 签名错误处理
+            if result.get("errcode") == 310000 and "签名不匹配" in result.get("errmsg", ""):
+                logging.warning("签名验证失败，尝试发送无签名消息")
+                plain_url = DINGTALK_WEBHOOK
+                plain_response = requests.post(plain_url, headers=headers, data=json.dumps(data))
+                plain_result = plain_response.json()
+                logging.info(f"无签名消息响应: {plain_result}")
+            
+            # 5.2 关键词错误处理
+            elif "关键词不匹配" in result.get("errmsg", ""):
+                logging.warning("关键词不匹配，强制添加关键词后重试")
+                forced_content = f"{' '.join(KEYWORDS)} {content}"
+                data["markdown"]["text"] = forced_content
+                forced_response = requests.post(url, headers=headers, data=json.dumps(data))
+                forced_result = forced_response.json()
+                logging.info(f"强制添加关键词后的响应: {forced_result}")
+        
+        return result
+    except Exception as e:
+        logging.error(f"发送钉钉消息时发生异常: {str(e)}")
+        return {"errcode": 500, "errmsg": str(e)}
+
+# 控制继电器函数
+def control_relay(ser, command, current_time, relay_id, action_type):
+    """发送命令控制继电器"""
+    ser.write(command)
+    message = f"已发送命令: {command} 到 继电器{relay_id}"
+    logging.info(message)
+    with file_lock:
+        with open('test_relay.txt', 'a') as file:
+            file.write(f"{current_time}: {message}\n")
+            file.flush()
+            os.fsync(file.fileno())
+    time.sleep(0.1)
+    return {
+        "relay_id": relay_id,
+        "action": action_type,
+        "status": "success",
+        "timestamp": current_time,
+        "command": command.hex()
+    }
+
+def main():
+    # 配置串口参数
+    SERIAL_PORTS = {
+        'relay': 'COM4'
+    }
+    BAUD_RATES = {
+        'relay': 9600
+    }
+
+    # 继电器操作计数器
+    relay_counts = {
+        '1_on': 0,
+        '1_off': 0,
+        '2_on': 0,
+        '2_off': 0
+    }
+    
+    # 记录所有操作结果
+    operation_logs = []
+    
+    # 继电器命令
+    RELAY_COMMANDS = {
+        1: (b'\xA0\x01\x01\xA2', b'\xA0\x01\x00\xA1'),  # 继电器1: 开, 关
+        2: (b'\xA0\x02\x01\xA3', b'\xA0\x02\x00\xA2'),  # 继电器2: 开, 关
+    }
+
+    # 打开控制继电器的串口
+    relay_ser = None
+    try:
+        relay_ser = serial.Serial(SERIAL_PORTS['relay'], BAUD_RATES['relay'], timeout=1)
+        logging.info(f"已连接到用于控制继电器的串口: {SERIAL_PORTS['relay']}")
+    except Exception as e:
+        logging.error(f"无法打开用于控制继电器的串口: {e}")
+        send_dingtalk_notification(f"# 继电器测试异常\n**错误信息**: 无法打开串口 {SERIAL_PORTS['relay']}\n\n{e}")
+        return
+
+    try:
+        # 执行测试循环
+        total_loops = 1000  # 设置为实际需要的测试次数
+        success_loops = 0
+        failed_loops = 0
+        
+        for loop_count in range(total_loops):
+            current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            loop_start_time = time.time()
+            
+            try:
+                logging.info(f"开始第 {loop_count+1}/{total_loops} 次循环")
+                
+                # 控制继电器1 - 长按按键
+                on_1, off_1 = RELAY_COMMANDS[1]
+                result = control_relay(relay_ser, on_1, current_time, 1, "on")
+                operation_logs.append(result)
+                relay_counts['1_on'] += 1
+                logging.info(f"{current_time},继电器 1 已打开!---------当前统计：继电器1开启次数 {relay_counts['1_on']}")
+                time.sleep(1)
+
+                # 控制继电器2 - 插入充电器
+                on_2, off_2 = RELAY_COMMANDS[2]
+                result = control_relay(relay_ser, on_2, current_time, 2, "on")
+                operation_logs.append(result)
+                relay_counts['2_on'] += 1
+                logging.info(f"{current_time},继电器 2 已打开!---------当前统计：继电器2开启次数 {relay_counts['2_on']}")
+
+                # 随机延迟后关闭继电器
+                close_delay = random.choice([1, 2, 3, 4, 5])
+                logging.info(f"{current_time},继电器 2 将在 {close_delay} 秒后关闭（关闭前先关1）")
+                time.sleep(close_delay)
+
+                # 关闭继电器1 - 松开按键
+                result = control_relay(relay_ser, off_1, current_time, 1, "off")
+                operation_logs.append(result)
+                relay_counts['1_off'] += 1
+                logging.info(f"{current_time},继电器 1 已关闭---------当前统计：继电器1关闭次数 {relay_counts['1_off']}")
+                time.sleep(1)
+
+                # 关闭继电器2 - 拔出充电器
+                result = control_relay(relay_ser, off_2, current_time, 2, "off")
+                operation_logs.append(result)
+                relay_counts['2_off'] += 1
+                logging.info(f"{current_time},继电器 2 已关闭---------当前统计：继电器2关闭次数 {relay_counts['2_off']}")
+                time.sleep(1)
+                
+                success_loops += 1
+                loop_time = time.time() - loop_start_time
+                logging.info(f"第 {loop_count+1} 次循环完成，耗时 {loop_time:.2f} 秒")
+                
+            except Exception as e:
+                failed_loops += 1
+                logging.error(f"第 {loop_count+1} 次循环出错: {e}")
+                operation_logs.append({
+                    "loop": loop_count+1,
+                    "status": "error",
+                    "error_message": str(e),
+                    "timestamp": current_time
+                })
+                
+                # 发生错误时，尝试重置继电器状态
+                try:
+                    control_relay(relay_ser, off_1, current_time, 1, "off")
+                    control_relay(relay_ser, off_2, current_time, 2, "off")
+                    logging.info("已重置继电器状态")
+                except:
+                    pass
+
+        logging.info(f"测试完成: 总共执行 {total_loops} 次循环，成功 {success_loops} 次，失败 {failed_loops} 次")
+
+        # 生成钉钉报告
+        report_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        report_content = f"""
+# **继电器自动化测试报告**
+- **测试时间**: {report_time}
+- **测试环境**: Windows 10
+- **串口配置**: {SERIAL_PORTS['relay']} @ {BAUD_RATES['relay']}bps
+
+## **测试结果汇总**
+| 测试项       | 总次数 | 成功次数 | 失败次数 | 成功率   |
+|--------------|--------|----------|----------|----------|
+| 继电器1开启  | {relay_counts['1_on']} | {success_loops} | {failed_loops} | {success_loops/relay_counts['1_on']*100:.2f}% |
+| 继电器1关闭  | {relay_counts['1_off']} | {success_loops} | {failed_loops} | {success_loops/relay_counts['1_off']*100:.2f}% |
+| 继电器2开启  | {relay_counts['2_on']} | {success_loops} | {failed_loops} | {success_loops/relay_counts['2_on']*100:.2f}% |
+| 继电器2关闭  | {relay_counts['2_off']} | {success_loops} | {failed_loops} | {success_loops/relay_counts['2_off']*100:.2f}% |
+
+## **测试执行情况**
+- 总循环次数: {total_loops}
+- 成功循环: {success_loops}
+- 失败循环: {failed_loops}
+- 总耗时: {(time.time() - loop_start_time)/60:.2f} 分钟
+
+## **最近10次操作记录**
+| 时间                | 继电器 | 操作   | 状态   |
+|---------------------|--------|--------|--------|
+"""
+        # 添加最近10次操作记录
+        recent_logs = operation_logs[-10:]
+        for log in recent_logs:
+            if 'relay_id' in log:
+                status_emoji = "✅" if log['status'] == 'success' else "❌"
+                report_content += f"| {log['timestamp']} | {log['relay_id']} | {'开启' if log['action'] == 'on' else '关闭'} | {log['status']} {status_emoji} |\n"
+            else:
+                report_content += f"| {log['timestamp']} | -      | 错误   | {log['error_message']} |\n"
+        
+        # 添加失败记录（如果有）
+        if failed_loops > 0:
+            report_content += "\n## **失败记录**\n"
+            error_logs = [log for log in operation_logs if log.get('status') == 'error']
+            for i, log in enumerate(error_logs[:5]):  # 只显示前5条
+                report_content += f"- **#{i+1}** {log['timestamp']}: {log['error_message']}\n"
+            if len(error_logs) > 5:
+                report_content += f"- ... 等 {len(error_logs)} 条错误记录"
+        
+        # 发送钉钉报告
+        send_result = send_dingtalk_notification(report_content)
+        if send_result.get("errcode") == 0:
+            logging.info("钉钉测试报告发送成功")
+        else:
+            # 备用方案：当Markdown发送失败时，尝试发送纯文本
+            plain_content = f"继电器测试报告：总执行{total_loops}次，成功{success_loops}次，失败{failed_loops}次\n" \
+                           f"继电器1开启{relay_counts['1_on']}次，关闭{relay_counts['1_off']}次\n" \
+                           f"继电器2开启{relay_counts['2_on']}次，关闭{relay_counts['2_off']}次\n" \
+                           f"完整报告查看：file://{os.path.abspath('relay_operation.log')}"
+            send_dingtalk_notification(plain_content)
+
+    except KeyboardInterrupt:
+        logging.info("程序已停止")
+    finally:
+        if relay_ser and relay_ser.is_open:
+            relay_ser.close()
+            logging.info("继电器串口已关闭")
+
+if __name__ == "__main__":
+    main()
